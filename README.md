@@ -1,33 +1,30 @@
-# prism 🔺
+# Prism 🔺
 
-**Destination-inferred protocol translation proxy for LLM APIs.**
+**LLM protocol bridge. Any provider, any coding agent, zero config.**
 
-Point prism at any target endpoint. It learns the response shape automatically.
-Everything coming from any upstream provider (Groq, Together, OpenRouter, Mistral, Gemini...)
-gets translated to match — headers, envelope, stop reasons, tool calls.
-
-No manual field mapping. No config files. The target IS the config.
+Point Prism between your AI coding tool and any LLM API provider.
+It auto-detects both ends, translates the wire protocol transparently,
+and preserves message content and tool calls exactly as-is.
 
 ---
 
-## The idea
+## What it does
 
-Every LLM API speaks a slightly different dialect of JSON.  
-Same concepts. Different wrappers.
+Every LLM provider speaks a slightly different wire format.
+Same concepts — messages, tool calls, stop reasons — different JSON shapes.
 
 ```
-Groq returns:          Claude Code expects:
-choices[0]             content[]
-finish_reason          stop_reason
-prompt_tokens          input_tokens
-tool_calls[]           content[type=tool_use]
+Claude Code (Anthropic format)          Any Provider (OpenAI-compat)
+──────────────────────────────          ────────────────────────────
+content[{type: text}]          ←──────→  choices[0].message.content
+stop_reason: "tool_use"        ←──────→  finish_reason: "tool_calls"
+content[{type: tool_use}]      ←──────→  choices[0].message.tool_calls
+usage.input_tokens             ←──────→  usage.prompt_tokens
 ```
 
-Prism sits between them. It probes your target once at startup,
-learns the exact shape it expects, then translates everything automatically.
-
-**Message content and tool call internals are never touched.**  
-Only the structural envelope gets rewritten.
+Prism sits in the middle and handles all of it. Your coding agent thinks
+it's talking to Anthropic. The provider thinks it's getting normal requests.
+Neither side needs to know the other exists.
 
 ---
 
@@ -35,106 +32,111 @@ Only the structural envelope gets rewritten.
 
 ```bash
 pip install prism-proxy
-
-# Point at Claude Code (or any Anthropic-compatible endpoint)
-prism start --target https://api.anthropic.com/v1/messages \
-            --target-key sk-ant-...
-
-# Your Groq/Together/OpenRouter app now hits localhost:8000
-# and gets back perfect Anthropic-shaped responses
+prism
 ```
 
----
+The TUI opens. From there:
 
-## How it works
+1. Enter provider name, URL, and API key
+2. Hit **Fetch Models** — pulls the live model list from the provider
+3. Select which models to include (space to toggle, `a` for all)
+4. Add more providers if you want
+5. Hit **Start Bridge**
 
-```
-1. startup
-   prism fires a minimal probe at your --target
-   captures the response shape → that's the translation contract
-
-2. runtime
-   upstream response arrives (any provider)
-   ↓
-   provider auto-detected from response shape
-   ↓
-   semantic slots extracted (response_text, stop_reason, tokens, tool_calls...)
-   ↓
-   slots mapped into target schema
-   ↓
-   headers translated + injected
-   ↓
-   target-shaped response returned
-```
-
----
-
-## Supported providers (auto-detected)
-
-| Provider | Format detected as |
-|---|---|
-| Groq | `openai-compat` |
-| Together AI | `openai-compat` |
-| OpenRouter | `openai-compat` |
-| Mistral (direct) | `openai-compat` |
-| Anthropic | `anthropic` |
-| Gemini | `gemini` |
-
----
-
-## Supported targets
-
-| Target | Schema type |
-|---|---|
-| Anthropic / Claude Code | `anthropic` |
-| OpenAI-compatible | `openai` |
-
----
-
-## Tool calls
-
-Tool call **internals** (function name, arguments, tool IDs) are always preserved verbatim.
-
-Only the wrapper format gets translated:
-
-```
-OpenAI tool_calls[] ←→ Anthropic content[type=tool_use]
-```
-
----
-
-## Environment variables
-
-| Variable | Description |
-|---|---|
-| `PRISM_TARGET` | Target endpoint URL |
-| `PRISM_TARGET_KEY` | API key for the target |
-| `PRISM_UPSTREAM_KEY` | Key to accept from callers (optional) |
-
----
-
-## Probe a target manually
+Then point your coding agent at prism:
 
 ```bash
-prism probe https://api.anthropic.com/v1/messages --key sk-ant-...
+ANTHROPIC_BASE_URL=http://localhost:8000
+ANTHROPIC_API_KEY=prism
 ```
 
-Prints the learned schema — useful for debugging unknown endpoints.
+That's it.
 
 ---
 
-## Kaggle / Colab + localtunnel
+## Headless mode
 
-```python
-# In your notebook:
-import subprocess, os
+For scripts or servers — no TUI:
 
-os.environ["PRISM_TARGET"]     = "https://api.anthropic.com/v1/messages"
-os.environ["PRISM_TARGET_KEY"] = "sk-ant-..."
+```bash
+# Single provider, multiple models (auto-fallback on rate limits)
+prism --provider https://api.mistral.ai/v1 \
+      --key sk-... \
+      --models mistral-small-latest,codestral-latest,mistral-large-latest
 
-subprocess.Popen(["prism", "start", "--port", "8000"])
-subprocess.Popen(["lt", "--port", "8000"])
+# Multi-provider via config file
+prism --config pool.yaml
 ```
+
+`pool.yaml` example:
+
+```yaml
+providers:
+  - url: https://api.mistral.ai/v1
+    key: your-mistral-key
+    models:
+      - mistral-small-latest
+      - codestral-latest
+
+  - url: https://api.groq.com/openai/v1
+    key: your-groq-key
+    models:
+      - llama-3.3-70b-versatile
+      - llama-3.1-8b-instant
+
+  - url: https://integrate.api.nvidia.com/v1
+    key: your-nvidia-key
+    models:
+      - nvidia/llama-3.3-nemotron-super-49b-v1
+      - moonshotai/kimi-k2-instruct
+```
+
+---
+
+## Pool and fallback
+
+When you add multiple models, Prism builds a pool and rotates through them:
+
+- **429 rate limit** → silently tries next model
+- **Timeout** → silently tries next model  
+- **3 failures** → that model is disabled for the session
+- **All entries exhausted** → returns 503 to the client
+
+Completely transparent. Your coding agent never sees the rotation happening.
+
+---
+
+## What gets translated
+
+**Request (client → provider):**
+- Message format (Anthropic content blocks ↔ OpenAI messages array)
+- System prompt (top-level Anthropic field ↔ system role message)
+- Tool definitions (input_schema ↔ parameters)
+- Tool results (tool_result blocks ↔ tool role messages)
+- Model name (whatever the client sends → your chosen provider model)
+
+**Response (provider → client):**
+- Content blocks (choices[0].message ↔ content[])
+- Stop reason (finish_reason ↔ stop_reason, with value mapping)
+- Tool calls (tool_calls array ↔ tool_use content blocks)
+- Token usage (prompt_tokens ↔ input_tokens)
+- Headers (rate limit headers, content-type, encoding)
+
+**Never touched:**
+- Tool function names and arguments
+- Message text content
+- Multi-turn conversation history structure
+
+---
+
+## Tested with
+
+**Client tools:** Claude Code
+
+**Providers:** Mistral AI, NVIDIA NIM, Groq
+
+**Confirmed working:** full agentic loop — multi-turn conversation,
+tool calls, bash execution, file writes, error recovery and retry.
 
 ---
 
@@ -142,16 +144,29 @@ subprocess.Popen(["lt", "--port", "8000"])
 
 ```
 prism/
-  slots.py       — semantic slot definitions + provider detection
-  learner.py     — target schema probing + learning
-  translator.py  — core response translation engine
-  headers.py     — header mapping + injection
-  proxy.py       — FastAPI server + request forwarding
-  __main__.py    — CLI (prism start / prism probe)
+  proxy.py              FastAPI server, request routing
+  bridge.py             Live state — pool + learned client format
+  pool.py               Provider pool, rotation, fallback logic
+  slots.py              Semantic slot definitions (the Rosetta Stone)
+  tui.py                Textual TUI
+  probe/
+    provider.py         Probe provider: GET /models, learn response shape
+    client.py           Learn client format from first request
+  translate/
+    request.py          Client request → provider request
+    response.py         Provider response → client response
+    headers.py          Header mapping and injection
 ```
+
+---
+
+## Requirements
+
+- Python 3.11+
+- Provider API key (Mistral, Groq, NVIDIA, or any OpenAI-compatible endpoint)
 
 ---
 
 ## License
 
-MIT — Alpha (github.com/Alpha-Legents)
+MIT — [Alpha-Legents](https://github.com/Alpha-Legents)
