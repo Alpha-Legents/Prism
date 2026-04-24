@@ -1,4 +1,4 @@
-# prism 🔺
+# Prism 🔺
 
 **Destination-inferred protocol translation proxy for LLM APIs.**
 
