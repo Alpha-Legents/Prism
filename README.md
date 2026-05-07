@@ -2,16 +2,15 @@
 
 **LLM protocol bridge. Any provider, any coding agent, zero config.**
 
-Point Prism between your AI coding tool and any LLM API provider.
-It auto-detects both ends, translates the wire protocol transparently,
-and preserves message content and tool calls exactly as-is.
+Point Prism between your AI coding tool and any LLM API provider. It auto-detects both ends, translates the wire protocol transparently, and preserves message content and tool calls exactly as-is.
+
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 ---
 
 ## What it does
 
-Every LLM provider speaks a slightly different wire format.
-Same concepts — messages, tool calls, stop reasons — different JSON shapes.
+Every LLM provider speaks a slightly different wire format. Same concepts — messages, tool calls, stop reasons — but different JSON shapes.
 
 ```
 Claude Code (Anthropic format)          Any Provider (OpenAI-compat)
@@ -22,9 +21,19 @@ content[{type: tool_use}]      ←──────→  choices[0].message.tool
 usage.input_tokens             ←──────→  usage.prompt_tokens
 ```
 
-Prism sits in the middle and handles all of it. Your coding agent thinks
-it's talking to Anthropic. The provider thinks it's getting normal requests.
-Neither side needs to know the other exists.
+Prism sits in the middle and handles all of it. Your coding agent thinks it's talking to Anthropic. The provider thinks it's getting normal requests. Neither side needs to know the other exists.
+
+---
+
+## Features
+
+✅ **Protocol Translation** - Seamlessly converts between Anthropic and OpenAI-compatible formats
+✅ **Multi-Provider Support** - Works with Mistral, Groq, NVIDIA, and any OpenAI-compatible endpoint
+✅ **Automatic Fallback** - Silently rotates through models on rate limits or timeouts
+✅ **Streaming Support** - Real-time translation of streaming responses
+✅ **Tool Call Preservation** - Maintains tool calls and results exactly as-is
+✅ **Deduplication** - Caches identical requests to avoid duplicate processing
+✅ **Throttling** - Built-in rate limiting to prevent provider abuse
 
 ---
 
@@ -49,8 +58,6 @@ Then point your coding agent at prism:
 ANTHROPIC_BASE_URL=http://localhost:8000
 ANTHROPIC_API_KEY=prism
 ```
-
-That's it.
 
 ---
 
@@ -93,7 +100,9 @@ providers:
 
 ---
 
-## Pool and fallback
+## Advanced Features
+
+### Pool and fallback
 
 When you add multiple models, Prism builds a pool and rotates through them:
 
@@ -102,7 +111,24 @@ When you add multiple models, Prism builds a pool and rotates through them:
 - **3 failures** → that model is disabled for the session
 - **All entries exhausted** → returns 503 to the client
 
-Completely transparent. Your coding agent never sees the rotation happening.
+### Model Mapping
+
+Use `--model-map` to interactively map frontend model endpoints to provider models:
+
+```bash
+prism --provider https://api.mistral.ai/v1 --key sk-... --model-map
+```
+
+### Environment Variables
+
+You can also configure Prism using environment variables:
+
+```bash
+PRISM_PROVIDER=https://api.mistral.ai/v1 \
+PRISM_KEY=sk-... \
+PRISM_MODEL=mistral-small-latest \
+prism
+```
 
 ---
 
@@ -131,12 +157,11 @@ Completely transparent. Your coding agent never sees the rotation happening.
 
 ## Tested with
 
-**Client tools:** Claude Code
+**Client tools:** Claude Code, Aider, Cursor, Continue, OpenCode, Cline
 
-**Providers:** Mistral AI, NVIDIA NIM, Groq
+**Providers:** Mistral AI, NVIDIA NIM, Groq, DeepSeek, Ollama
 
-**Confirmed working:** full agentic loop — multi-turn conversation,
-tool calls, bash execution, file writes, error recovery and retry.
+**Confirmed working:** full agentic loop — multi-turn conversation, tool calls, bash execution, file writes, error recovery and retry.
 
 ---
 
@@ -146,16 +171,18 @@ tool calls, bash execution, file writes, error recovery and retry.
 prism/
   proxy.py              FastAPI server, request routing
   bridge.py             Live state — pool + learned client format
-  pool.py               Provider pool, rotation, fallback logic
   slots.py              Semantic slot definitions (the Rosetta Stone)
-  tui.py                Textual TUI
+  tui.py                Textual TUI (if available)
   probe/
     provider.py         Probe provider: GET /models, learn response shape
     client.py           Learn client format from first request
+    capabilities.py     Detect model capabilities (thinking blocks, etc)
+    frontends.py        Known frontend model lists
   translate/
     request.py          Client request → provider request
     response.py         Provider response → client response
     headers.py          Header mapping and injection
+    stream.py           Streaming response translation
 ```
 
 ---
@@ -167,6 +194,44 @@ prism/
 
 ---
 
+## Installation
+
+```bash
+pip install prism-proxy
+```
+
+Or from source:
+
+```bash
+git clone https://github.com/Alpha-Legents/prism
+hcd prism
+pip install -e .
+```
+
+---
+
 ## License
 
 MIT — [Alpha-Legents](https://github.com/Alpha-Legents)
+
+---
+
+## Contributing
+
+Contributions are welcome! Please open an issue or submit a pull request.
+
+---
+
+## Support
+
+For questions or issues, please open a GitHub issue.
+
+---
+
+## Roadmap
+
+- [ ] Add support for more provider-specific features
+- [ ] Implement request/response logging
+- [ ] Add metrics endpoint for monitoring
+- [ ] Support for more client tools
+- [ ] Improved error handling and recovery
