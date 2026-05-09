@@ -1,6 +1,5 @@
 ﻿__pycache__/
 *.pyc
-*.pyo
 *.egg-info/
 dist/
 build/
@@ -9,4 +8,3 @@ build/
 venv/
 *.log
 .DS_Store
-prism_proxy.egg-info/

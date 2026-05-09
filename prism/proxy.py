@@ -1,4 +1,4 @@
-"""Prism proxy server — with real streaming."""
+"""Prism proxy server — with real streaming, dedup, throttle, dynamic model list."""
 
 import logging
 import json
@@ -27,19 +27,45 @@ logger = logging.getLogger("prism.proxy")
 app = FastAPI(title="Prism", version="0.3.0")
 
 # ── Deduplication ─────────────────────────────────────────────────────────────
-_cache:    dict[str, dict]         = {}
+# Claude Code fires two parallel requests per turn. We cache the first
+# response and return it for the duplicate so the real answer always wins.
+_cache:    dict[str, dict]          = {}
 _inflight: dict[str, asyncio.Event] = {}
-_CACHE_TTL = 10
+_CACHE_TTL = 10  # seconds
 
 # ── Throttle ──────────────────────────────────────────────────────────────────
+# One real provider request at a time + delay to stay under RPS limits.
 _throttle      = asyncio.Semaphore(1)
 _REQUEST_DELAY = 2.0
 
 
 def _fingerprint(body: dict) -> str:
+    """Stable hash from full message list + model — prevents cross-turn cache hits."""
     msgs  = body.get("messages", [])
-    last  = json.dumps(msgs[-1]) if msgs else ""
-    return hashlib.md5(f"{len(msgs)}:{last}".encode()).hexdigest()
+    model = body.get("model", "")
+    raw   = f"{model}:{len(msgs)}:{json.dumps(msgs, sort_keys=True)}"
+    return hashlib.md5(raw.encode()).hexdigest()
+
+
+# ── Dynamic model list ────────────────────────────────────────────────────────
+
+def _get_model_list() -> list[str]:
+    """
+    Return model list from the provider if available,
+    otherwise fall back to known Claude model IDs so Claude Code passes validation.
+    """
+    bridge = get_bridge()
+    if bridge.provider and bridge.provider.models:
+        return bridge.provider.models
+
+    # Fallback — known Claude model IDs
+    return [
+        "claude-opus-4-7", "claude-opus-4-5",
+        "claude-sonnet-4-6", "claude-sonnet-4-5",
+        "claude-haiku-4-5", "claude-haiku-3-5",
+        "claude-3-5-sonnet-20241022", "claude-3-5-haiku-20241022",
+        "claude-3-opus-20240229",
+    ]
 
 
 # ── Compat endpoints ──────────────────────────────────────────────────────────
@@ -47,17 +73,18 @@ def _fingerprint(body: dict) -> str:
 @app.get("/v1/models")
 @app.get("/models")
 async def list_models():
-    MODELS = [
-        "claude-opus-4-7", "claude-opus-4-5",
-        "claude-sonnet-4-6", "claude-sonnet-4-5",
-        "claude-haiku-4-5", "claude-haiku-3-5",
-        "claude-3-5-sonnet-20241022", "claude-3-5-haiku-20241022",
-        "claude-3-opus-20240229",
-    ]
-    return {"object": "list", "data": [
-        {"id": m, "object": "model", "created": 1700000000, "owned_by": "anthropic"}
-        for m in MODELS
-    ]}
+    """
+    Return model list. Uses provider's real model list if available,
+    else falls back to known Claude model IDs so client tools pass validation.
+    """
+    models = _get_model_list()
+    return {
+        "object": "list",
+        "data": [
+            {"id": m, "object": "model", "created": 1700000000, "owned_by": "prism"}
+            for m in models
+        ],
+    }
 
 
 @app.post("/v1/messages/count_tokens")
@@ -79,15 +106,18 @@ async def health():
     return get_bridge().status()
 
 
-# ── Non-streaming fallback parser ─────────────────────────────────────────────
+# ── SSE fallback ──────────────────────────────────────────────────────────────
 
 def _parse_sse_to_dict(text: str) -> dict:
+    """Reassemble a collected SSE stream into a single response dict."""
     chunks, content = [], ""
     for line in text.splitlines():
         line = line.strip()
         if line.startswith("data:") and line != "data: [DONE]":
-            try: chunks.append(json.loads(line[5:].strip()))
-            except: pass
+            try:
+                chunks.append(json.loads(line[5:].strip()))
+            except Exception:
+                pass
     if not chunks:
         return {"error": "empty SSE stream"}
     base = chunks[-1]
@@ -95,7 +125,8 @@ def _parse_sse_to_dict(text: str) -> dict:
         content += (c.get("choices", [{}])[0].get("delta") or {}).get("content") or ""
     if base.get("choices"):
         msg = base["choices"][0].get("message") or base["choices"][0].get("delta", {})
-        if content: msg["content"] = content
+        if content:
+            msg["content"] = content
         base["choices"][0]["message"] = msg
     return base
 
@@ -116,40 +147,54 @@ async def _handle(request: Request, path: str):
     except Exception:
         body = {}
 
-    req_headers   = dict(request.headers)
+    req_headers         = dict(request.headers)
     client_wants_stream = body.get("stream", False)
 
     logger.info("")
     logger.info(f"━━━━ /{path} ━━━━")
-    logger.info(f"IN  model={body.get('model')} msgs={len(body.get('messages', []))} tools={len(body.get('tools', []))} stream={client_wants_stream}")
+    logger.info(
+        f"IN  model={body.get('model')} "
+        f"msgs={len(body.get('messages', []))} "
+        f"tools={len(body.get('tools', []))} "
+        f"stream={client_wants_stream}"
+    )
 
-    # ── Deduplication (skip for streaming — can't cache a stream) ─────────────
+    # ── Deduplication (non-streaming only) ────────────────────────────────────
     fp = _fingerprint(body)
 
     if not client_wants_stream:
         now = time.time()
+        # Expire old cache entries
         for k in list(_cache.keys()):
             if now - _cache[k]["ts"] > _CACHE_TTL:
                 del _cache[k]
 
         if fp in _cache:
-            logger.info("DEDUP hit")
+            logger.info("DEDUP hit — returning cached response")
             cached = _cache[fp]
-            return JSONResponse(content=cached["response"], status_code=200, headers=cached["headers"])
+            return JSONResponse(
+                content=cached["response"],
+                status_code=200,
+                headers=cached["headers"],
+            )
 
         if fp in _inflight:
-            logger.info("DEDUP waiting...")
+            logger.info("DEDUP waiting for inflight...")
             try:
                 await asyncio.wait_for(_inflight[fp].wait(), timeout=30)
             except asyncio.TimeoutError:
                 pass
             if fp in _cache:
                 cached = _cache[fp]
-                return JSONResponse(content=cached["response"], status_code=200, headers=cached["headers"])
+                return JSONResponse(
+                    content=cached["response"],
+                    status_code=200,
+                    headers=cached["headers"],
+                )
 
         _inflight[fp] = asyncio.Event()
 
-    # ── Learn client ──────────────────────────────────────────────────────────
+    # ── Learn client on first request ─────────────────────────────────────────
     if not bridge.client or not bridge.client.learned:
         bridge.client = learn_from_request(body, req_headers)
         logger.info(f"CLIENT: {bridge.client.format} / {bridge.client.tool_hint}")
@@ -157,14 +202,17 @@ async def _handle(request: Request, path: str):
     client_format   = bridge.client.format
     provider_format = bridge.provider_format
 
-    # Resolve which provider model to use for this request
-    requested_model  = body.get("model")
-    resolved_model   = bridge.resolve_model(requested_model)
+    # ── Resolve model ─────────────────────────────────────────────────────────
+    requested_model = body.get("model")
+    resolved_model  = bridge.resolve_model(requested_model)
 
     if not resolved_model:
+        if fp in _inflight:
+            _inflight[fp].set()
+            del _inflight[fp]
         raise HTTPException(503, detail={
             "error": f"No model mapped for '{requested_model}'",
-            "hint":  "Add a mapping with --model-map or set a --model fallback",
+            "hint":  "Use --model-map to map frontend models, or --model for single mode",
         })
 
     logger.info(f"MODEL: {requested_model} → {resolved_model}")
@@ -176,8 +224,7 @@ async def _handle(request: Request, path: str):
         provider_format = provider_format,
         model_override  = resolved_model,
     )
-    # Always stream from provider — we handle both cases
-    translated_req["stream"] = True
+    translated_req["stream"] = True  # always stream from provider
 
     out_headers = {
         "Content-Type":    "application/json",
@@ -186,11 +233,11 @@ async def _handle(request: Request, path: str):
     if bridge.api_key:
         out_headers["Authorization"] = f"Bearer {bridge.api_key}"
 
-    logger.info(f"→ {bridge.completion_url} [{resolved_model}] streaming=True")
+    logger.info(f"→ {bridge.completion_url} [{resolved_model}]")
 
-    # ── Streaming response path ───────────────────────────────────────────────
+    # ── Streaming path ────────────────────────────────────────────────────────
     if client_wants_stream:
-        async def _stream_generator():
+        async def _stream_gen():
             async with _throttle:
                 async with httpx.AsyncClient(timeout=300) as client:
                     async with client.stream(
@@ -200,39 +247,40 @@ async def _handle(request: Request, path: str):
                         headers=out_headers,
                     ) as resp:
                         if resp.status_code != 200:
-                            error_body = await resp.aread()
-                            logger.error(f"Provider error {resp.status_code}: {error_body[:200]}")
-                            yield f"data: {json.dumps({'type': 'error', 'error': {'type': 'api_error', 'message': f'Provider returned {resp.status_code}'}})}\n\n"
+                            err = await resp.aread()
+                            logger.error(f"Provider {resp.status_code}: {err[:200]}")
+                            yield (
+                                f"data: {json.dumps({'type': 'error', 'error': {'type': 'api_error', 'message': f'Provider returned {resp.status_code}'}})}\n\n"
+                            )
                             return
 
-                        async def chunk_iter():
+                        async def _lines():
                             async for line in resp.aiter_lines():
                                 if line:
                                     yield line.encode()
 
                         async for event in translate_stream(
-                            chunk_iter(),
+                            _lines(),
                             client_format = client_format,
-                            model         = bridge.model,
+                            model         = resolved_model,   # ← fixed: was bridge.model
                         ):
                             yield event
 
                 await asyncio.sleep(_REQUEST_DELAY)
 
         return StreamingResponse(
-            _stream_generator(),
+            _stream_gen(),
             media_type = "text/event-stream",
             headers    = {
-                "cache-control":    "no-cache",
+                "cache-control":     "no-cache",
                 "x-accel-buffering": "no",
                 "anthropic-version": "2023-06-01",
                 "content-encoding":  "identity",
             },
         )
 
-    # ── Non-streaming response path ───────────────────────────────────────────
-    # Still request stream=True from provider, collect all chunks, return JSON
-    collected_lines: list[str] = []
+    # ── Non-streaming path ────────────────────────────────────────────────────
+    collected: list[str] = []
 
     async with _throttle:
         async with httpx.AsyncClient(timeout=300) as client:
@@ -244,19 +292,19 @@ async def _handle(request: Request, path: str):
                     headers=out_headers,
                 ) as resp:
                     if resp.status_code != 200:
-                        error_body = await resp.aread()
+                        err_body = await resp.aread()
                         if fp in _inflight:
                             _inflight[fp].set()
                             del _inflight[fp]
                         try:
-                            err = json.loads(error_body)
+                            err = json.loads(err_body)
                         except Exception:
-                            err = {"error": error_body.decode()[:500]}
+                            err = {"error": err_body.decode()[:500]}
                         return JSONResponse(content=err, status_code=resp.status_code)
 
                     async for line in resp.aiter_lines():
                         if line:
-                            collected_lines.append(line)
+                            collected.append(line)
 
             except httpx.ReadTimeout:
                 logger.error("TIMEOUT")
@@ -273,16 +321,14 @@ async def _handle(request: Request, path: str):
 
         await asyncio.sleep(_REQUEST_DELAY)
 
-    # Reassemble SSE lines into a full response dict
-    raw_text = "\n".join(collected_lines)
+    # Reassemble
+    raw_text = "\n".join(collected)
     try:
-        # Try as plain JSON first (some providers ignore stream=True)
         raw = json.loads(raw_text)
     except Exception:
         raw = _parse_sse_to_dict(raw_text)
 
-    # Learn capabilities from full response
-    learn_from_chunk(bridge.model, raw)
+    learn_from_chunk(resolved_model, raw)  # ← fixed: was bridge.model
 
     logger.info(f"RAW: {json.dumps(raw)[:400]}")
 

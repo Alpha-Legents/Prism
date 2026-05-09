@@ -4,15 +4,15 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name        = "prism-proxy"
-version     = "0.1.0"
-description = "Destination-inferred protocol translation proxy for LLM APIs"
+version     = "0.3.0"
+description = "LLM protocol bridge — any provider, any coding agent, zero config"
 readme      = "README.md"
 license     = { text = "MIT" }
 requires-python = ">=3.11"
 
 keywords = [
-    "llm", "proxy", "anthropic", "openai", "groq",
-    "claude", "protocol-translation", "api-gateway",
+    "llm", "proxy", "anthropic", "openai", "groq", "mistral",
+    "claude", "protocol-translation", "api-bridge", "coding-agent",
 ]
 
 dependencies = [
@@ -27,5 +27,5 @@ dependencies = [
 prism = "prism.__main__:main"
 
 [tool.setuptools.packages.find]
-where = ["."]
+where   = ["."]
 include = ["prism*"]
