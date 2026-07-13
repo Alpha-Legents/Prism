@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "prism_proxy"
-version = "0.4.0"
-description = "FastAPI proxy for Claude Code, LLM agents, Composer — v0.4.0"
+version = "0.5.0"
+description = "FastAPI proxy for Claude Code, LLM agents, Composer — v0.5.0"
 authors = [{name = "Aaron Lijo", email = "aaronlijo@gmail.com"}]
 license = {text = "MIT"}
 readme = "README.md"
