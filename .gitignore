@@ -1,0 +1,14 @@
+﻿__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+.env
+.venv/
+venv/
+*.log
+.DS_Store
+.pytest_cache/
+PKG-INFO
+prism_config.yaml
+tests/

@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "prism_proxy"
+version = "0.4.0"
+description = "FastAPI proxy for Claude Code, LLM agents, Composer — v0.4.0"
+authors = [{name = "Aaron Lijo", email = "aaronlijo@gmail.com"}]
+license = {text = "MIT"}
+readme = "README.md"
+keywords = ["proxy", "LLM", "AI", "gateway", "bridge"]
+requires-python = ">=3.10"
+dependencies = [
+  "fastapi >= 0.109",
+  "httpx >= 0.26",
+  "uvicorn >= 0.26",
+  "click >= 8.1",
+  "pygments >= 2.17",
+  "colorama >= 0.4",
+  "jmespath >= 1.0",
+  "pyyaml >= 6.0",
+]
+
+[project.scripts]
+prism = "prism.__main__:main"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
