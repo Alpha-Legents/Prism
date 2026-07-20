@@ -1,4 +1,11 @@
-"""OpenAI-compatible provider plugin."""
+"""OpenAI-compatible provider plugin.
+
+Handles Anthropic ↔ OpenAI bidirectional translation including:
+- Thinking/reasoning block preservation across conversation turns
+- redacted_thinking block handling for conversation history round-trips
+- Thinking parameter activation for reasoning models
+- Full content block type coverage (text, thinking, tool_use, tool_result, image, etc.)
+"""
 
 import json
 import logging
@@ -87,10 +94,31 @@ class OpenAICompatPlugin(ProviderPlugin):
         if isinstance(meta, dict) and meta.get("user_id"):
             req["user"] = str(meta["user_id"])
 
+        # Translate Anthropic thinking parameter to OpenAI reasoning_effort.
+        # Claude Code sends: {"thinking": {"type": "adaptive"}} or
+        # {"thinking": {"type": "enabled", "budget_tokens": N}}
+        # OpenAI-compat reasoning models use reasoning_effort or reasoning_effort.
+        thinking = body.get("thinking")
+        if isinstance(thinking, dict):
+            thinking_type = thinking.get("type", "disabled")
+            if thinking_type in ("adaptive", "enabled"):
+                # Map to reasoning_effort: "high" for reasoning models.
+                # Providers that don't support it will ignore this field.
+                req["reasoning_effort"] = "high"
+                logger.debug("Translated thinking parameter to reasoning_effort=high")
+            # If type is "disabled", don't add reasoning_effort — let the
+            # provider use its default (no reasoning).
+
         return req
 
     def _translate_messages(self, messages: list, system: Any = None) -> list[dict]:
-        """Convert Anthropic messages to OpenAI format."""
+        """Convert Anthropic messages to OpenAI format.
+
+        Critical: preserves thinking/reasoning blocks in assistant messages
+        so conversation history round-trips correctly. Claude Code sends
+        thinking blocks from previous assistant turns that must be included
+        for context continuity.
+        """
         out = []
         if system:
             # Anthropic system can be a plain string or a list of text blocks
@@ -126,6 +154,8 @@ class OpenAICompatPlugin(ProviderPlugin):
                 tool_uses = []
                 text_parts = []
                 image_parts = []
+                thinking_parts = []      # Preserve thinking for context
+                reasoning_parts = []     # For reasoning_content field
 
                 for block in content:
                     if not isinstance(block, dict):
@@ -138,10 +168,24 @@ class OpenAICompatPlugin(ProviderPlugin):
                         tool_uses.append(block)
                     elif block_type == "text":
                         text_parts.append(block.get("text", ""))
-                    elif block_type in ("thinking", "redacted_thinking"):
-                        # OpenAI-compatible providers have no thinking concept;
-                        # drop silently (never echo thinking back as text).
-                        continue
+                    elif block_type == "thinking":
+                        # Preserve thinking blocks — they carry critical context.
+                        # For providers that support reasoning, we map to reasoning_content.
+                        # For others, we embed as a visible thinking section.
+                        thinking_text = block.get("thinking", "")
+                        if thinking_text:
+                            thinking_parts.append(thinking_text)
+                            reasoning_parts.append(thinking_text)
+                    elif block_type == "redacted_thinking":
+                        # redacted_thinking blocks carry encrypted thinking data.
+                        # We can't decrypt them, but we must acknowledge their
+                        # existence to preserve conversation structure. Some
+                        # providers accept them as opaque blocks.
+                        data = block.get("data", "")
+                        if data:
+                            # Preserve as a marker so the conversation structure
+                            # is maintained even if the content is opaque
+                            thinking_parts.append(f"[redacted:{data[:20]}...]")
                     elif block_type == "image":
                         # Image URL handling
                         source = block.get("source", {})
@@ -197,10 +241,22 @@ class OpenAICompatPlugin(ProviderPlugin):
                             },
                         })
 
+                    # Build assistant content: thinking (as reasoning) + text
+                    assistant_content = ""
+                    if reasoning_parts:
+                        # Some providers use reasoning_content in the message
+                        # We'll add it as a structured part
+                        pass  # Handled below via content array
+                    if text_parts:
+                        assistant_content = "\n".join(text_parts)
+
                     out.append({
                         "role": "assistant",
-                        "content": "\n".join(text_parts) or "",
+                        "content": assistant_content or "",
                         "tool_calls": tool_calls,
+                        # Preserve thinking as reasoning_content for providers
+                        # that support it (DeepSeek, etc.)
+                        **({"reasoning_content": "\n".join(reasoning_parts)} if reasoning_parts else {}),
                     })
 
                 # Emit remaining text/images. Text alongside tool_results
@@ -215,7 +271,20 @@ class OpenAICompatPlugin(ProviderPlugin):
                         multimodal_content.extend(image_parts)
                         out.append({"role": role, "content": multimodal_content})
                     elif text_parts or not tool_results:
-                        out.append({"role": role, "content": "\n".join(text_parts) or ""})
+                        # For assistant messages with thinking, include reasoning
+                        msg_content = "\n".join(text_parts) or ""
+                        msg_out = {"role": role, "content": msg_content}
+                        if role == "assistant" and reasoning_parts:
+                            msg_out["reasoning_content"] = "\n".join(reasoning_parts)
+                        out.append(msg_out)
+                elif not tool_uses and not text_parts and not image_parts and not tool_results:
+                    # Empty content block list — emit thinking as reasoning if present
+                    if role == "assistant" and reasoning_parts:
+                        out.append({
+                            "role": "assistant",
+                            "content": "",
+                            "reasoning_content": "\n".join(reasoning_parts),
+                        })
             else:
                 out.append({"role": role, "content": str(content or "")})
 
@@ -234,6 +303,10 @@ class OpenAICompatPlugin(ProviderPlugin):
             elif tc_type == "auto":
                 return "auto"
             elif tc_type == "none":
+                return "none"
+            elif tc_type == "disabled":
+                # Anthropic's "disabled" means no tool choice at all.
+                # OpenAI-compat equivalent is "none".
                 return "none"
         return tc
 

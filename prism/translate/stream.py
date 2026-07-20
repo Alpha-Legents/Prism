@@ -83,6 +83,16 @@ class _AnthropicStreamBuilder:
 
     def close_open(self, events: list[str]) -> None:
         if self.open_index is not None:
+            # For thinking blocks, emit signature_delta before content_block_stop.
+            # Claude Code requires a signature on every thinking block — without
+            # it the SDK throws "Content block is not a thinking block" or
+            # silently discards the thinking, causing context loss.
+            if self.open_kind == "thinking":
+                events.append(_sse("content_block_delta", {
+                    "type": "content_block_delta",
+                    "index": self.open_index,
+                    "delta": {"type": "signature_delta", "signature": ""},
+                }))
             events.append(_sse("content_block_stop", {
                 "type": "content_block_stop",
                 "index": self.open_index,
@@ -185,10 +195,13 @@ class _AnthropicStreamBuilder:
 
     def _start_pending(self, events: list[str], tc_index: int) -> None:
         pending = self.pending_tools.pop(tc_index)
+        # Anthropic protocol requires non-empty name in tool_use blocks.
+        # Use a synthetic name if provider never sent one.
+        tool_name = pending["name"] or f"unknown_tool_{tc_index}"
         self._open(events, "tool", {
             "type": "tool_use",
             "id": pending["id"] or f"toolu_prism_{uuid4().hex[:12]}",
-            "name": pending["name"] or "",
+            "name": tool_name,
             "input": {},
         }, tc_index=tc_index)
         self.started_tools.add(tc_index)
@@ -331,6 +344,11 @@ async def translate_stream(
     if not provider_usage:
         # No usage from provider: rough char-based estimate (~4 chars/token)
         usage["output_tokens"] = max(1, builder.output_chars // 4)
+
+    # Ensure cache token fields are always present — Claude Code's SDK
+    # reads these and will crash or produce wrong accounting if missing.
+    usage.setdefault("cache_creation_input_tokens", 0)
+    usage.setdefault("cache_read_input_tokens", 0)
 
     yield _sse("message_delta", {
         "type": "message_delta",

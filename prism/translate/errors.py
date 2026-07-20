@@ -5,6 +5,7 @@ Maps provider error shapes to Anthropic-format errors.
 
 import json
 import logging
+from uuid import uuid4
 
 logger = logging.getLogger("prism.translate.errors")
 
@@ -27,7 +28,7 @@ ERROR_MAP = {
     502: ("api_error", "Bad gateway from provider"),
     503: ("api_error", "Provider service unavailable"),
     504: ("api_error", "Provider gateway timeout"),
-    529: ("overloaded_error", "Provider is overloaded — retry with exponential backoff"),
+    529: ("overloaded_error", "Provider is overloaded \u2014 retry with exponential backoff"),
 }
 
 # Anthropic error types that trigger specific client behavior
@@ -48,13 +49,14 @@ CONTEXT_EXCEEDED_PATTERNS = [
 ]
 
 
-def translate_error(error_response: dict | str, status_code: int) -> dict:
+def translate_error(error_response: dict | str, status_code: int, retry_after: float | None = None) -> dict:
     """
     Translate a provider error into Anthropic error format.
 
     Args:
         error_response: The provider's error response body (dict or JSON string)
         status_code: HTTP status code
+        retry_after: Optional retry-after seconds from provider headers
 
     Returns:
         Anthropic-format error dict:
@@ -74,18 +76,25 @@ def translate_error(error_response: dict | str, status_code: int) -> dict:
     # Try to extract the provider's error message from various error shapes
     message = _extract_message(parsed) or default_msg
 
-    # Check for context window exceeded (overrides other classifications)
+    # Check for context window exceeded (overrides other classification)
     if _is_context_window_exceeded(parsed, message):
         error_type = "invalid_request_error"
         message = _clean_context_message(message)
 
-    return {
+    result = {
         "type": "error",
         "error": {
             "type": error_type,
             "message": message,
         },
     }
+
+    # Include retry_after for rate-limit and overloaded errors so Claude Code
+    # can backoff correctly instead of hammering the provider.
+    if retry_after is not None and error_type in ANTHROPIC_RETRY_ERRORS:
+        result["error"]["retry_after"] = retry_after
+
+    return result
 
 
 def is_retryable(error_type: str) -> bool:
@@ -100,6 +109,9 @@ def is_fatal(error_type: str) -> bool:
 
 def _extract_message(parsed: dict) -> str | None:
     """Extract error message from various provider error shapes."""
+    # Guard against non-dict input (list, int, None, etc.)
+    if not isinstance(parsed, dict):
+        return str(parsed) if parsed is not None else None
     # OpenAI format: {"error": {"message": "...", "type": "..."}}
     error_obj = parsed.get("error", parsed)
 
@@ -123,6 +135,8 @@ def _extract_message(parsed: dict) -> str | None:
 
 def _is_context_window_exceeded(parsed: dict, message: str) -> bool:
     """Detect context window exceeded errors from any provider."""
+    if not isinstance(parsed, dict):
+        return False
     error_obj = parsed.get("error", parsed)
     error_type = ""
     if isinstance(error_obj, dict):
@@ -140,7 +154,7 @@ def _clean_context_message(message: str) -> str:
     msg_lower = message.lower()
     for p in CONTEXT_EXCEEDED_PATTERNS:
         if p in msg_lower:
-            return f"Prompt too long: context window exceeded. Try shortening the conversation or summarizing context."
+            return "Prompt too long: context window exceeded. Try shortening the conversation or summarizing context."
     return message
 
 
