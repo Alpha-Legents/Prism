@@ -43,6 +43,19 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+@app.get("/v1/validate")
+async def validate_api_key(request: Request):
+    """Validate API key endpoint — Claude Code calls this on startup.
+
+    Returns a minimal successful response to confirm the proxy is working.
+    """
+    return {
+        "valid": True,
+        "proxy": "prism",
+        "version": "0.7.0",
+    }
+
 # Status codes that indicate the current API key is exhausted/blocked and we
 # should rotate to the next one. Transient 5xx errors keep the current key.
 KEY_ROTATION_STATUS_CODES = {401, 402, 403, 429}
