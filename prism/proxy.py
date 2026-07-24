@@ -213,6 +213,36 @@ async def engine_chat_completions(request: Request, engine_id: str):
     return await _handle_request(request, "chat/completions")
 
 
+# MCP and agent endpoints
+@app.post("/v1/messages/complete")
+async def messages_complete(request: Request):
+    """Alternative message endpoint used by some agent frameworks."""
+    return await _handle_request(request, "messages")
+
+
+@app.post("/v1/assistants/{assistant_id}/chat")
+async def assistant_chat(request: Request, assistant_id: str):
+    """OpenAI Assistants API chat endpoint."""
+    return await _handle_request(request, "chat/completions")
+
+
+# Some agent frameworks use these paths
+@app.post("/api/chat")
+async def api_chat(request: Request):
+    return await _handle_request(request, "chat/completions")
+
+
+@app.post("/chat")
+async def chat(request: Request):
+    return await _handle_request(request, "chat/completions")
+
+
+@app.post("/v1/conversation")
+async def conversation(request: Request):
+    """Conversation endpoint used by some chat frameworks."""
+    return await _handle_request(request, "chat/completions")
+
+
 # Catch-all for any other POST to unknown paths — try to handle it
 @app.post("/{path:path}")
 async def catch_all_post(request: Request, path: str):
@@ -393,75 +423,130 @@ def _rotate_key_if_needed(bridge, status_code: int) -> None:
 
 # ── Streaming response ───────────────────────────────────────────────────
 
+# Status codes that trigger automatic retry with next key
+RETRY_STATUS_CODES = {401, 402, 403, 429, 529}
+MAX_RETRIES = 3
+
+
+def _extract_retry_after(headers) -> float | None:
+    """Extract retry-after value from response headers."""
+    retry_header = headers.get("retry-after") or headers.get("Retry-After")
+    if retry_header:
+        try:
+            return float(retry_header)
+        except (ValueError, TypeError):
+            pass
+    return None
+
+
+def _yield_error(anthro_error: dict, client_format: str):
+    """Yield an error event in the correct format."""
+    if client_format == "anthropic":
+        yield f"event: error\ndata: {json.dumps(anthro_error)}\n\n"
+    else:
+        yield f"data: {json.dumps({'error': anthro_error['error']})}\n\n"
+        yield "data: [DONE]\n\n"
+
+
 async def _stream_response(translated, headers, provider_url, resolved_model, bridge, client_format="anthropic"):
-    """Handle streaming response with proper SSE translation."""
+    """Handle streaming response with automatic retry on failure.
+
+    On rate-limit, auth, or overloaded errors, automatically rotates
+    to the next API key and retries (up to MAX_RETRIES times).
+    """
 
     async def _stream_gen():
         global _error_count
-        try:
-            async with httpx.AsyncClient(timeout=300) as client:
-                async with client.stream("POST", provider_url, json=translated, headers=headers) as resp:
-                    if resp.status_code != 200:
-                        err_body = await resp.aread()
-                        _error_count += 1
-                        logger.error(f"Provider error: {resp.status_code} {err_body[:200]}")
-                        _rotate_key_if_needed(bridge, resp.status_code)
-                        err_text = err_body.decode("utf-8", errors="replace")
-                        try:
-                            err_json = json.loads(err_text)
-                        except json.JSONDecodeError:
-                            err_json = err_text
-                        retry_after = None
-                        retry_header = resp.headers.get("retry-after") or resp.headers.get("Retry-After")
-                        if retry_header:
+        last_error = None
+
+        for attempt in range(MAX_RETRIES + 1):
+            try:
+                # Rotate key before each attempt (except first)
+                if attempt > 0:
+                    api_key = bridge.get_current_api_key()
+                    if api_key:
+                        headers["Authorization"] = f"Bearer {api_key}"
+                    logger.info(f"Retry attempt {attempt}/{MAX_RETRIES} with key index {bridge.config.key_index}")
+
+                async with httpx.AsyncClient(timeout=300) as client:
+                    async with client.stream("POST", provider_url, json=translated, headers=headers) as resp:
+                        if resp.status_code in RETRY_STATUS_CODES:
+                            err_body = await resp.aread()
+                            _error_count += 1
+                            logger.warning(f"Retryable error {resp.status_code} on attempt {attempt}: {err_body[:100]}")
+
+                            # Rotate key and retry
+                            bridge.mark_key_exhausted(bridge.config.key_index)
+                            bridge.advance_key()
+
+                            if attempt < MAX_RETRIES:
+                                last_error = (resp.status_code, err_body)
+                                continue  # Retry with next key
+                            else:
+                                # Final attempt failed — return error
+                                err_text = err_body.decode("utf-8", errors="replace")
+                                try:
+                                    err_json = json.loads(err_text)
+                                except json.JSONDecodeError:
+                                    err_json = err_text
+                                retry_after = _extract_retry_after(resp.headers)
+                                anthro_error = translate_error(err_json, resp.status_code, retry_after=retry_after)
+                                _yield_error(anthro_error, client_format)
+                                return
+
+                        if resp.status_code != 200:
+                            err_body = await resp.aread()
+                            _error_count += 1
+                            logger.error(f"Provider error: {resp.status_code} {err_body[:200]}")
+                            err_text = err_body.decode("utf-8", errors="replace")
                             try:
-                                retry_after = float(retry_header)
-                            except (ValueError, TypeError):
-                                pass
-                        anthro_error = translate_error(err_json, resp.status_code, retry_after=retry_after)
+                                err_json = json.loads(err_text)
+                            except json.JSONDecodeError:
+                                err_json = err_text
+                            retry_after = _extract_retry_after(resp.headers)
+                            anthro_error = translate_error(err_json, resp.status_code, retry_after=retry_after)
+                            _yield_error(anthro_error, client_format)
+                            return
+
+                        # Success — stream the response
+                        bridge.advance_key()
                         if client_format == "anthropic":
-                            yield f"event: error\ndata: {json.dumps(anthro_error)}\n\n"
+                            async for line in translate_stream(resp.aiter_lines(), "anthropic", resolved_model, source_format="openai-compat"):
+                                yield line
                         else:
-                            yield f"data: {json.dumps({'error': anthro_error['error']})}\n\n"
-                            yield "data: [DONE]\n\n"
-                        return
+                            async for line in resp.aiter_lines():
+                                if line.strip():
+                                    yield line + "\n" if not line.endswith("\n") else line
+                        return  # Success, done
 
-                    bridge.advance_key()
+            except httpx.TimeoutException:
+                _error_count += 1
+                logger.warning(f"Timeout on attempt {attempt}")
+                bridge.mark_key_exhausted(bridge.config.key_index)
+                bridge.advance_key()
+                if attempt < MAX_RETRIES:
+                    continue
+                _yield_error(translate_error({"error": {"message": "Provider request timed out"}}, 504), client_format)
+                return
 
-                    if client_format == "anthropic":
-                        async for line in translate_stream(resp.aiter_lines(), "anthropic", resolved_model, source_format="openai-compat"):
-                            yield line
-                    else:
-                        async for line in resp.aiter_lines():
-                            if line.strip():
-                                yield line + "\n" if not line.endswith("\n") else line
-        except httpx.TimeoutException:
-            _error_count += 1
-            logger.error(f"Provider timeout: {provider_url}")
-            if client_format == "anthropic":
-                anthro_error = translate_error({"error": {"message": "Provider request timed out"}}, 504)
-                yield f"event: error\ndata: {json.dumps(anthro_error)}\n\n"
-            else:
-                yield f"data: {json.dumps({'error': {'message': 'Provider request timed out', 'type': 'timeout_error'}})}\n\n"
-                yield "data: [DONE]\n\n"
-        except httpx.ConnectError as e:
-            _error_count += 1
-            logger.error(f"Provider connection error: {e}")
-            if client_format == "anthropic":
-                anthro_error = translate_error({"error": {"message": f"Failed to connect to provider: {e}"}}, 502)
-                yield f"event: error\ndata: {json.dumps(anthro_error)}\n\n"
-            else:
-                yield f"data: {json.dumps({'error': {'message': f'Failed to connect to provider: {e}', 'type': 'connection_error'}})}\n\n"
-                yield "data: [DONE]\n\n"
-        except Exception as e:
-            _error_count += 1
-            logger.error(f"Unexpected error in stream: {e}")
-            if client_format == "anthropic":
-                anthro_error = translate_error({"error": {"message": f"Internal proxy error: {e}"}}, 500)
-                yield f"event: error\ndata: {json.dumps(anthro_error)}\n\n"
-            else:
-                yield f"data: {json.dumps({'error': {'message': f'Internal proxy error: {e}', 'type': 'server_error'}})}\n\n"
-                yield "data: [DONE]\n\n"
+            except httpx.ConnectError as e:
+                _error_count += 1
+                logger.warning(f"Connection error on attempt {attempt}: {e}")
+                bridge.mark_key_exhausted(bridge.config.key_index)
+                bridge.advance_key()
+                if attempt < MAX_RETRIES:
+                    continue
+                _yield_error(translate_error({"error": {"message": f"Failed to connect: {e}"}}, 502), client_format)
+                return
+
+            except Exception as e:
+                _error_count += 1
+                logger.error(f"Unexpected error on attempt {attempt}: {e}")
+                _yield_error(translate_error({"error": {"message": f"Internal proxy error: {e}"}}, 500), client_format)
+                return
+
+        # Should not reach here, but just in case
+        _yield_error(translate_error({"error": {"message": "Max retries exceeded"}}, 502), client_format)
 
     response_headers = {
         "Content-Type": "text/event-stream",
@@ -481,128 +566,178 @@ async def _stream_response(translated, headers, provider_url, resolved_model, br
 # ── Non-streaming response ──────────────────────────────────────────────
 
 async def _non_stream_response(translated, headers, provider_url, resolved_model, bridge, original_body, client_format="anthropic"):
-    """Handle non-streaming response by streaming from provider and buffering."""
+    """Handle non-streaming response with automatic retry on failure."""
     global _error_count
 
-    collected_text = []
-    collected_reasoning = []
-    tool_calls_by_index: dict = {}
-    finish_reason = None
-    provider_usage: dict = {}
-    response_model = resolved_model
+    for attempt in range(MAX_RETRIES + 1):
+        collected_text = []
+        collected_reasoning = []
+        tool_calls_by_index: dict = {}
+        finish_reason = None
+        provider_usage: dict = {}
+        response_model = resolved_model
 
-    try:
-        async with httpx.AsyncClient(timeout=300) as client:
-            async with client.stream("POST", provider_url, json=translated, headers=headers) as resp:
-                if resp.status_code != 200:
-                    _error_count += 1
-                    err_body = await resp.aread()
-                    logger.error(f"Provider error: {resp.status_code} {err_body[:200]}")
-                    _rotate_key_if_needed(bridge, resp.status_code)
-                    err_text = err_body.decode("utf-8", errors="replace")
-                    try:
-                        err_json = json.loads(err_text)
-                    except json.JSONDecodeError:
-                        err_json = err_text
-                    retry_after = None
-                    retry_header = resp.headers.get("retry-after") or resp.headers.get("Retry-After")
-                    if retry_header:
+        try:
+            # Rotate key before each attempt (except first)
+            if attempt > 0:
+                api_key = bridge.get_current_api_key()
+                if api_key:
+                    headers["Authorization"] = f"Bearer {api_key}"
+                logger.info(f"Retry attempt {attempt}/{MAX_RETRIES} with key index {bridge.config.key_index}")
+
+            async with httpx.AsyncClient(timeout=300) as client:
+                async with client.stream("POST", provider_url, json=translated, headers=headers) as resp:
+                    if resp.status_code in RETRY_STATUS_CODES:
+                        err_body = await resp.aread()
+                        _error_count += 1
+                        logger.warning(f"Retryable error {resp.status_code} on attempt {attempt}")
+
+                        bridge.mark_key_exhausted(bridge.config.key_index)
+                        bridge.advance_key()
+
+                        if attempt < MAX_RETRIES:
+                            continue  # Retry with next key
+                        else:
+                            err_text = err_body.decode("utf-8", errors="replace")
+                            try:
+                                err_json = json.loads(err_text)
+                            except json.JSONDecodeError:
+                                err_json = err_text
+                            retry_after = _extract_retry_after(resp.headers)
+                            return JSONResponse(
+                                content=translate_error(err_json, resp.status_code, retry_after=retry_after),
+                                status_code=resp.status_code if resp.status_code < 500 else 502,
+                            )
+
+                    if resp.status_code != 200:
+                        err_body = await resp.aread()
+                        _error_count += 1
+                        logger.error(f"Provider error: {resp.status_code} {err_body[:200]}")
+                        err_text = err_body.decode("utf-8", errors="replace")
                         try:
-                            retry_after = float(retry_header)
-                        except (ValueError, TypeError):
-                            pass
-                    anthro_error = translate_error(err_json, resp.status_code, retry_after=retry_after)
-                    return JSONResponse(content=anthro_error, status_code=resp.status_code)
+                            err_json = json.loads(err_text)
+                        except json.JSONDecodeError:
+                            err_json = err_text
+                        retry_after = _extract_retry_after(resp.headers)
+                        return JSONResponse(
+                            content=translate_error(err_json, resp.status_code, retry_after=retry_after),
+                            status_code=resp.status_code if resp.status_code < 500 else 502,
+                        )
 
-                bridge.advance_key()
+                    bridge.advance_key()
 
-                async for line in resp.aiter_lines():
-                    if not line or not line.startswith("data:"):
-                        continue
-                    data_str = line[5:].strip()
-                    if data_str == "[DONE]":
-                        break
-                    try:
-                        data = json.loads(data_str)
-                    except json.JSONDecodeError:
-                        continue
-                    if not isinstance(data, dict):
-                        continue
+                    async for line in resp.aiter_lines():
+                        if not line or not line.startswith("data:"):
+                            continue
+                        data_str = line[5:].strip()
+                        if data_str == "[DONE]":
+                            break
+                        try:
+                            data = json.loads(data_str)
+                        except json.JSONDecodeError:
+                            continue
+                        if not isinstance(data, dict):
+                            continue
 
-                    if data.get("error"):
-                        anthro_error = translate_error(data, 502)
-                        return JSONResponse(content=anthro_error, status_code=502)
+                        if data.get("error"):
+                            return JSONResponse(
+                                content=translate_error(data, 502),
+                                status_code=502,
+                            )
 
-                    if isinstance(data.get("usage"), dict):
-                        for k, v in data["usage"].items():
-                            if v is not None:
-                                provider_usage[k] = v
-                    if data.get("model"):
-                        response_model = data["model"]
+                        if isinstance(data.get("usage"), dict):
+                            for k, v in data["usage"].items():
+                                if v is not None:
+                                    provider_usage[k] = v
+                        if data.get("model"):
+                            response_model = data["model"]
 
-                    choices = data.get("choices", [])
-                    if choices:
-                        choice_data = choices[0]
-                        delta = choice_data.get("delta", {})
+                        choices = data.get("choices", [])
+                        if choices:
+                            choice_data = choices[0]
+                            delta = choice_data.get("delta", {})
 
-                        reasoning = delta.get("reasoning_content") or delta.get("reasoning")
-                        if reasoning:
-                            collected_reasoning.append(str(reasoning))
+                            reasoning = delta.get("reasoning_content") or delta.get("reasoning")
+                            if reasoning:
+                                collected_reasoning.append(str(reasoning))
 
-                        content = delta.get("content", "")
-                        if content:
-                            collected_text.append(content)
+                            content = delta.get("content", "")
+                            if content:
+                                collected_text.append(content)
 
-                        delta_tool_calls = delta.get("tool_calls", []) or []
-                        for tc in delta_tool_calls:
-                            index = tc.get("index", 0)
-                            fn = tc.get("function", {}) or {}
-                            if index not in tool_calls_by_index:
-                                tool_calls_by_index[index] = {
-                                    "id": tc.get("id", ""),
-                                    "type": tc.get("type", "function"),
-                                    "function": {
-                                        "name": fn.get("name", ""),
-                                        "arguments": fn.get("arguments", "") or "",
+                            delta_tool_calls = delta.get("tool_calls", []) or []
+                            for tc in delta_tool_calls:
+                                index = tc.get("index", 0)
+                                fn = tc.get("function", {}) or {}
+                                if index not in tool_calls_by_index:
+                                    tool_calls_by_index[index] = {
+                                        "id": tc.get("id", ""),
+                                        "type": tc.get("type", "function"),
+                                        "function": {
+                                            "name": fn.get("name", ""),
+                                            "arguments": fn.get("arguments", "") or "",
+                                        }
                                     }
-                                }
-                            else:
-                                existing = tool_calls_by_index[index]
-                                if tc.get("id") and not existing["id"]:
-                                    existing["id"] = tc["id"]
-                                if fn.get("name") and not existing["function"]["name"]:
-                                    existing["function"]["name"] = fn["name"]
-                                existing["function"]["arguments"] += fn.get("arguments", "") or ""
+                                else:
+                                    existing = tool_calls_by_index[index]
+                                    if tc.get("id") and not existing["id"]:
+                                        existing["id"] = tc["id"]
+                                    if fn.get("name") and not existing["function"]["name"]:
+                                        existing["function"]["name"] = fn["name"]
+                                    existing["function"]["arguments"] += fn.get("arguments", "") or ""
 
-                        if choice_data.get("finish_reason"):
-                            finish_reason = choice_data["finish_reason"]
-    except httpx.TimeoutException:
-        _error_count += 1
-        logger.error(f"Provider timeout: {provider_url}")
-        anthro_error = translate_error({"error": {"message": "Provider request timed out"}}, 504)
-        return JSONResponse(content=anthro_error, status_code=504)
-    except httpx.ConnectError as e:
-        _error_count += 1
-        logger.error(f"Provider connection error: {e}")
-        anthro_error = translate_error({"error": {"message": f"Failed to connect to provider: {e}"}}, 502)
-        return JSONResponse(content=anthro_error, status_code=502)
-    except Exception as e:
-        _error_count += 1
-        logger.error(f"Unexpected error in non-streaming: {e}")
-        anthro_error = translate_error({"error": {"message": f"Internal proxy error: {e}"}}, 500)
-        return JSONResponse(content=anthro_error, status_code=500)
+                            if choice_data.get("finish_reason"):
+                                finish_reason = choice_data["finish_reason"]
 
-    # Build response in the format the client expects
-    if client_format == "anthropic":
-        return _build_anthropic_response(
-            collected_text, collected_reasoning, tool_calls_by_index,
-            finish_reason, provider_usage, response_model
-        )
-    else:
-        return _build_openai_response(
-            collected_text, collected_reasoning, tool_calls_by_index,
-            finish_reason, provider_usage, response_model
-        )
+                    # Success — build and return response
+                    if client_format == "anthropic":
+                        return _build_anthropic_response(
+                            collected_text, collected_reasoning, tool_calls_by_index,
+                            finish_reason, provider_usage, response_model
+                        )
+                    else:
+                        return _build_openai_response(
+                            collected_text, collected_reasoning, tool_calls_by_index,
+                            finish_reason, provider_usage, response_model
+                        )
+
+        except httpx.TimeoutException:
+            _error_count += 1
+            logger.warning(f"Timeout on attempt {attempt}")
+            bridge.mark_key_exhausted(bridge.config.key_index)
+            bridge.advance_key()
+            if attempt < MAX_RETRIES:
+                continue
+            return JSONResponse(
+                content=translate_error({"error": {"message": "Provider request timed out"}}, 504),
+                status_code=504,
+            )
+
+        except httpx.ConnectError as e:
+            _error_count += 1
+            logger.warning(f"Connection error on attempt {attempt}: {e}")
+            bridge.mark_key_exhausted(bridge.config.key_index)
+            bridge.advance_key()
+            if attempt < MAX_RETRIES:
+                continue
+            return JSONResponse(
+                content=translate_error({"error": {"message": f"Failed to connect: {e}"}}, 502),
+                status_code=502,
+            )
+
+        except Exception as e:
+            _error_count += 1
+            logger.error(f"Unexpected error on attempt {attempt}: {e}")
+            return JSONResponse(
+                content=translate_error({"error": {"message": f"Internal proxy error: {e}"}}, 500),
+                status_code=500,
+            )
+
+    # Should not reach here
+    return JSONResponse(
+        content=translate_error({"error": {"message": "Max retries exceeded"}}, 502),
+        status_code=502,
+    )
 
 
 def _build_anthropic_response(collected_text, collected_reasoning, tool_calls_by_index,

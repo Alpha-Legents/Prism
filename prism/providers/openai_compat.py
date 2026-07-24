@@ -10,6 +10,7 @@ Handles Anthropic ↔ OpenAI bidirectional translation including:
 import json
 import logging
 from typing import Any
+from uuid import uuid4
 
 from .base import ProviderPlugin
 
@@ -201,6 +202,38 @@ class OpenAICompatPlugin(ProviderPlugin):
                                 "type": "image_url",
                                 "image_url": {"url": source["url"]}
                             })
+                    elif block_type == "document":
+                        # Document blocks (PDFs, files) — extract text content
+                        source = block.get("source", {})
+                        if source.get("type") == "text":
+                            text_parts.append(source.get("text", ""))
+                        elif source.get("type") == "base64":
+                            text_parts.append(f"[document:{source.get('media_type', 'unknown')}]")
+                    elif block_type == "server_tool_use":
+                        # MCP server tool use — preserve as tool_use for context
+                        tool_uses.append({
+                            "type": "tool_use",
+                            "id": block.get("id", f"toolu_mcp_{uuid4().hex[:12]}"),
+                            "name": block.get("name", "unknown_tool"),
+                            "input": block.get("input", {}),
+                        })
+                    elif block_type == "server_tool_result":
+                        # MCP server tool result — preserve as tool_result
+                        tool_results.append({
+                            "type": "tool_result",
+                            "tool_use_id": block.get("tool_use_id", ""),
+                            "content": block.get("content", ""),
+                        })
+                    elif block_type == "web_search_tool_result":
+                        # Web search results — extract text content
+                        content_block = block.get("content", [])
+                        if isinstance(content_block, list):
+                            for item in content_block:
+                                if isinstance(item, dict) and item.get("type") == "text":
+                                    text_parts.append(item.get("text", ""))
+                    elif block_type == "citations":
+                        # Citation blocks — skip (not needed for context)
+                        pass
 
                 # Emit tool results as separate messages
                 if tool_results:
