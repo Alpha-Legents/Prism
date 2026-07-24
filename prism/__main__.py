@@ -15,6 +15,7 @@ try:
     C = Fore
     R = Style.RESET_ALL
     B = Style.BRIGHT
+    D = Style.DIM
 except ImportError:
     # Fallback: no colors
     class _NoColor:
@@ -22,6 +23,7 @@ except ImportError:
     C = _NoColor()
     R = ""
     B = ""
+    D = ""
 
 BANNER = f"""
 {C.CYAN}{B}  ██████╗ ██████╗ ██╗███████╗███╗   ███╗
@@ -108,15 +110,15 @@ def interactive_model_mapping(provider_models: list[str]) -> dict:
         for i, m in enumerate(provider_models[:20], 1):
             print(f"    {C.YELLOW}{i:2d}.{R} {m}")
         if len(provider_models) > 20:
-            print(f"    {C.DIM}... and {len(provider_models) - 20} more{R}")
+            print(f"    {D}... and {len(provider_models) - 20} more{R}")
         print()
 
     mapping = {}
 
     for model_id, description in CLAUDE_MODELS:
         try:
-            print(f"  {C.CYAN}{B}{model_id}{R} {C.DIM}({description}){R}")
-            value = input(f"    {C.GREEN}→{R} provider model {C.DIM}(Enter to skip):{R} ").strip()
+            print(f"  {C.CYAN}{B}{model_id}{R} {D}({description}){R}")
+            value = input(f"    {C.GREEN}→{R} provider model {D}(Enter to skip):{R} ").strip()
             if value.lower() == "done":
                 break
             if value:
@@ -131,7 +133,7 @@ def interactive_model_mapping(provider_models: list[str]) -> dict:
                     mapping[model_id] = value
                     print(f"    {C.GREEN}✓{R} Mapped to {value}")
             else:
-                print(f"    {C.DIM}· Skipped{R}")
+                print(f"    {D}· Skipped{R}")
             print()
         except (EOFError, KeyboardInterrupt):
             print()
@@ -152,7 +154,7 @@ def print_success_box(model_map, model, fallback_model, host, port):
         for k, v in list(model_map.items())[:5]:
             print(f"  {C.GREEN}{B}│{R}    {k:28s} → {v:28s} {C.GREEN}{B}│{R}")
         if len(model_map) > 5:
-            print(f"  {C.GREEN}{B}│{R}    {C.DIM}... and {len(model_map) - 5} more{R}                              {C.GREEN}{B}│{R}")
+            print(f"  {C.GREEN}{B}│{R}    {D}... and {len(model_map) - 5} more{R}                              {C.GREEN}{B}│{R}")
         if fallback_model:
             print(f"  {C.GREEN}{B}│{R}  {C.YELLOW}Fallback:{R} {fallback_model:47s} {C.GREEN}{B}│{R}")
     else:
@@ -164,13 +166,13 @@ def print_success_box(model_map, model, fallback_model, host, port):
     print(f"  {C.GREEN}{B}│{R}                                                              {C.GREEN}{B}│{R}")
     print(f"  {C.GREEN}{B}│{R}  {C.CYAN}Claude Code:{R}                                              {C.GREEN}{B}│{R}")
     print(f"  {C.GREEN}{B}│{R}    ANTHROPIC_BASE_URL=http://localhost:{port:<24} {C.GREEN}{B}│{R}")
-    print(f"  {C.GREEN}{B}│{R}    ANTHROPIC_API_KEY=prism{C.DIM}  (or any value){R}              {C.GREEN}{B}│{R}")
+    print(f"  {C.GREEN}{B}│{R}    ANTHROPIC_API_KEY=prism{D}  (or any value){R}              {C.GREEN}{B}│{R}")
     print(f"  {C.GREEN}{B}│{R}                                                              {C.GREEN}{B}│{R}")
     print(f"  {C.GREEN}{B}│{R}  {C.CYAN}Cursor / Aider / Cline:{R}                                   {C.GREEN}{B}│{R}")
     print(f"  {C.GREEN}{B}│{R}    OPENAI_BASE_URL=http://localhost:{port:<23} {C.GREEN}{B}│{R}")
-    print(f"  {C.GREEN}{B}│{R}    OPENAI_API_KEY=prism{C.DIM}  (or any value){R}               {C.GREEN}{B}│{R}")
+    print(f"  {C.GREEN}{B}│{R}    OPENAI_API_KEY=prism{D}  (or any value){R}               {C.GREEN}{B}│{R}")
     print(f"  {C.GREEN}{B}│{R}                                                              {C.GREEN}{B}│{R}")
-    print(f"  {C.GREEN}{B}│{R}  {C.DIM}Status: http://localhost:{port}/health{R}                    {C.GREEN}{B}│{R}")
+    print(f"  {C.GREEN}{B}│{R}  {D}Status: http://localhost:{port}/health{R}                    {C.GREEN}{B}│{R}")
     print(f"  {C.GREEN}{B}└─────────────────────────────────────────────────────────────┘{R}")
     print()
 
@@ -233,7 +235,7 @@ def main():
         print(f"    prism --provider https://openrouter.ai/api/v1 --key sk-... --interactive")
         print(f"    prism --provider https://api.groq.com/openai/v1 --key sk-... --model llama-3.3-70b-versatile")
         print(f"    prism -c prism_config.yaml")
-        print(f"\n  {C.DIM}Set PRISM_PROVIDER and PRISM_KEY env vars to skip --provider and --key{R}")
+        print(f"\n  {D}Set PRISM_PROVIDER and PRISM_KEY env vars to skip --provider and --key{R}")
         sys.exit(1)
 
     if not model and not model_map and not args.interactive:
@@ -274,7 +276,7 @@ def main():
             print(f"  {C.RED}No mappings configured. Exiting.{R}")
             sys.exit(1)
         # Save the mapping for next time
-        print(f"  {C.DIM}Tip: Save this to a config file with: prism --provider {provider} --key ... --model-map '{','.join(f'{k}={v}' for k,v in model_map.items())}'{R}")
+        print(f"  {D}Tip: Save this to a config file with: prism --provider {provider} --key ... --model-map '{','.join(f'{k}={v}' for k,v in model_map.items())}'{R}")
 
     # Configure bridge
     bridge = get_bridge()
