@@ -55,7 +55,19 @@ class OpenAICompatPlugin(ProviderPlugin):
         self._supports_thinking = False
 
     def translate_request(self, body: dict, model_override: str | None = None) -> dict:
-        """Translate Anthropic request to OpenAI-compatible format."""
+        """Translate Anthropic request to OpenAI-compatible format.
+
+        Handles all Claude Code parameters:
+        - model, messages, system, tools, tool_choice
+        - max_tokens, temperature, top_p, top_k
+        - thinking → reasoning_effort
+        - betas (stripped for OpenAI-compat)
+        - metadata → user
+        - stop_sequences → stop
+        - stream, stream_options
+        - response_format
+        - cache_control markers (stripped)
+        """
         messages = self._translate_messages(body.get("messages", []), body.get("system"))
         tools = self._translate_tools(body.get("tools", []))
 
@@ -65,7 +77,7 @@ class OpenAICompatPlugin(ProviderPlugin):
             "stream": body.get("stream", True),
         }
 
-        # Optional fields - only add if present in original request
+        # Core parameters
         if body.get("max_tokens") is not None:
             req["max_tokens"] = body["max_tokens"]
         if body.get("max_completion_tokens") is not None:
@@ -77,38 +89,59 @@ class OpenAICompatPlugin(ProviderPlugin):
         if body.get("top_k") is not None:
             req["top_k"] = body["top_k"]
         if body.get("stop_sequences"):
-            # Anthropic stop_sequences -> OpenAI stop
             req["stop"] = body["stop_sequences"]
+
+        # Tools
         if tools:
             req["tools"] = tools
         tc_raw = body.get("tool_choice")
         if tc_raw is not None:
             req["tool_choice"] = self._translate_tool_choice(tc_raw)
-            # Anthropic disable_parallel_tool_use -> OpenAI parallel_tool_calls
             if isinstance(tc_raw, dict) and tc_raw.get("disable_parallel_tool_use"):
                 req["parallel_tool_calls"] = False
+
+        # Response format
         if body.get("response_format") is not None:
             req["response_format"] = body["response_format"]
-        # Anthropic metadata.user_id -> OpenAI 'user' (the native equivalent).
-        # Passing 'metadata' through verbatim breaks strict providers.
+
+        # Metadata → user
         meta = body.get("metadata")
         if isinstance(meta, dict) and meta.get("user_id"):
             req["user"] = str(meta["user_id"])
 
-        # Translate Anthropic thinking parameter to OpenAI reasoning_effort.
-        # Claude Code sends: {"thinking": {"type": "adaptive"}} or
-        # {"thinking": {"type": "enabled", "budget_tokens": N}}
-        # OpenAI-compat reasoning models use reasoning_effort or reasoning_effort.
+        # Thinking → reasoning_effort
         thinking = body.get("thinking")
         if isinstance(thinking, dict):
             thinking_type = thinking.get("type", "disabled")
             if thinking_type in ("adaptive", "enabled"):
-                # Map to reasoning_effort: "high" for reasoning models.
-                # Providers that don't support it will ignore this field.
                 req["reasoning_effort"] = "high"
-                logger.debug("Translated thinking parameter to reasoning_effort=high")
-            # If type is "disabled", don't add reasoning_effort — let the
-            # provider use its default (no reasoning).
+                logger.debug("Translated thinking to reasoning_effort=high")
+
+        # Effort from output_config (Claude Code sends this)
+        output_config = body.get("output_config")
+        if isinstance(output_config, dict):
+            effort = output_config.get("effort")
+            if effort and "reasoning_effort" not in req:
+                # Map Anthropic effort levels to OpenAI reasoning_effort
+                effort_map = {"low": "low", "medium": "medium", "high": "high"}
+                req["reasoning_effort"] = effort_map.get(str(effort), "high")
+
+        # Stream options (for usage reporting)
+        if body.get("stream_options") is not None:
+            req["stream_options"] = body["stream_options"]
+
+        # Log stripped parameters for debugging
+        stripped = []
+        if body.get("betas"):
+            stripped.append("betas")
+        if body.get("context_management"):
+            stripped.append("context_management")
+        if body.get("speed"):
+            stripped.append("speed")
+        if body.get("cache_control"):
+            stripped.append("cache_control")
+        if stripped:
+            logger.debug(f"Stripped Anthropic-only params: {stripped}")
 
         return req
 
