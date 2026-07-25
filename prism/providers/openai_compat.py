@@ -185,9 +185,6 @@ class OpenAICompatPlugin(ProviderPlugin):
             if isinstance(content, str):
                 # Handle string content (assistant with pre-built tool_calls)
                 if msg.get("tool_calls") and role == "assistant":
-                    # Fix ordering: if last was 'tool', we need 'assistant' first
-                    if last_role == "tool":
-                        out.append({"role": "assistant", "content": ""})
                     out.append({
                         "role": "assistant",
                         "content": content or "",
@@ -195,9 +192,6 @@ class OpenAICompatPlugin(ProviderPlugin):
                     })
                     last_role = "assistant"
                 else:
-                    # Fix ordering: after 'tool', must have 'assistant' before 'user'
-                    if last_role == "tool" and role == "user":
-                        out.append({"role": "assistant", "content": ""})
                     out.append({"role": role, "content": content or ""})
                     last_role = role
             elif isinstance(content, list):
@@ -290,11 +284,6 @@ class OpenAICompatPlugin(ProviderPlugin):
                                     text_content.append("[image attached]")
                             rc = "\n".join(text_content)
 
-                        # Fix ordering: tool results need assistant before them
-                        # if the last message wasn't already assistant
-                        if last_role != "assistant" and last_role is not None:
-                            out.append({"role": "assistant", "content": ""})
-
                         out.append({
                             "role": "tool",
                             "tool_call_id": tr.get("tool_use_id", ""),
@@ -322,10 +311,6 @@ class OpenAICompatPlugin(ProviderPlugin):
 
                     assistant_content = "\n".join(text_parts) if text_parts else ""
 
-                    # Fix ordering: after tool, must have assistant
-                    if last_role == "tool":
-                        pass  # We're emitting assistant now, so it's fine
-
                     out.append({
                         "role": "assistant",
                         "content": assistant_content,
@@ -336,10 +321,6 @@ class OpenAICompatPlugin(ProviderPlugin):
 
                 # Emit remaining text/images (no tool calls)
                 if not tool_uses and (text_parts or image_parts or not tool_results):
-                    # Fix ordering: after tool, must have assistant before user
-                    if last_role == "tool" and role == "user":
-                        out.append({"role": "assistant", "content": ""})
-
                     if image_parts:
                         multimodal_content = []
                         if text_parts:
