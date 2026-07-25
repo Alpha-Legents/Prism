@@ -314,6 +314,9 @@ async def _handle_request(request: Request, path: str):
     for i in range(len(roles) - 1):
         if roles[i] == "tool" and roles[i+1] == "user":
             logger.error(f"PRE-FLIGHT FAIL: tool[{i}]→user[{i+1}] will be rejected!")
+            # Log the actual messages
+            logger.error(f"  tool msg: {json.dumps(messages[i])[:300]}")
+            logger.error(f"  user msg: {json.dumps(messages[i+1])[:300]}")
         if roles[i] == "system" and i > 0:
             logger.error(f"PRE-FLIGHT FAIL: system at position {i} (not first)!")
 

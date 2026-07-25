@@ -151,6 +151,8 @@ class OpenAICompatPlugin(ProviderPlugin):
         for i in range(len(out_roles) - 1):
             if out_roles[i] == "tool" and out_roles[i+1] == "user":
                 logger.error(f"POST-FLIGHT FAIL: tool[{i}]→user[{i+1}] in output!")
+                logger.error(f"  tool msg: {json.dumps(req['messages'][i])[:300]}")
+                logger.error(f"  user msg: {json.dumps(req['messages'][i+1])[:300]}")
             if out_roles[i] == "system" and i > 0:
                 logger.error(f"POST-FLIGHT FAIL: system at position {i}!")
 
