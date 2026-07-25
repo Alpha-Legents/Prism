@@ -295,13 +295,6 @@ class OpenAICompatPlugin(ProviderPlugin):
                         })
                         last_role = "tool"
 
-                    # After all tool results, add a minimal assistant message
-                    # if the next message is user (required by OpenAI-compat providers)
-                    # Use content="." to avoid "Invalid empty assistant" errors
-                    if role == "user" or (not tool_uses and not text_parts):
-                        out.append({"role": "assistant", "content": "."})
-                        last_role = "assistant"
-
                 # Emit tool uses as assistant message
                 if tool_uses:
                     tool_calls = []
