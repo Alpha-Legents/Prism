@@ -154,13 +154,12 @@ class OpenAICompatPlugin(ProviderPlugin):
         for context continuity.
 
         Message ordering fix: OpenAI-compat providers require strict
-        assistant→tool→assistant→tool ordering. After a 'tool' role message,
-        the next message MUST be 'assistant'. We insert empty assistant
-        messages when needed to satisfy this constraint.
+        assistant→tool→assistant→tool ordering. System messages must be
+        first, never after tool messages.
         """
         out = []
 
-        # System message goes first (but may need to be repeated if tools appear)
+        # System message goes first — always at position 0
         system_text = ""
         if system:
             if isinstance(system, list):
@@ -172,7 +171,6 @@ class OpenAICompatPlugin(ProviderPlugin):
             else:
                 system_text = str(system)
 
-        # Add system message at the start
         if system_text:
             out.append({"role": "system", "content": system_text})
 
@@ -181,6 +179,12 @@ class OpenAICompatPlugin(ProviderPlugin):
         for msg in messages:
             role = msg.get("role", "user")
             content = msg.get("content")
+
+            # Skip system messages in the messages array — they would appear
+            # after tool messages and break ordering. System prompt is already
+            # handled via the `system` parameter.
+            if role == "system":
+                continue
 
             if isinstance(content, str):
                 # Handle string content (assistant with pre-built tool_calls)
@@ -290,6 +294,13 @@ class OpenAICompatPlugin(ProviderPlugin):
                             "content": rc or "",
                         })
                         last_role = "tool"
+
+                    # After all tool results, add a minimal assistant message
+                    # if the next message is user (required by OpenAI-compat providers)
+                    # Use content="." to avoid "Invalid empty assistant" errors
+                    if role == "user" or (not tool_uses and not text_parts):
+                        out.append({"role": "assistant", "content": "."})
+                        last_role = "assistant"
 
                 # Emit tool uses as assistant message
                 if tool_uses:
