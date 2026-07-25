@@ -152,11 +152,17 @@ class OpenAICompatPlugin(ProviderPlugin):
         so conversation history round-trips correctly. Claude Code sends
         thinking blocks from previous assistant turns that must be included
         for context continuity.
+
+        Message ordering fix: OpenAI-compat providers require strict
+        assistant→tool→assistant→tool ordering. After a 'tool' role message,
+        the next message MUST be 'assistant'. We insert empty assistant
+        messages when needed to satisfy this constraint.
         """
         out = []
+
+        # System message goes first (but may need to be repeated if tools appear)
+        system_text = ""
         if system:
-            # Anthropic system can be a plain string or a list of text blocks
-            # (Claude Code sends TextBlockParam[] with cache_control).
             if isinstance(system, list):
                 system_text = "\n\n".join(
                     b.get("text", "")
@@ -165,8 +171,12 @@ class OpenAICompatPlugin(ProviderPlugin):
                 )
             else:
                 system_text = str(system)
-            if system_text:
-                out.append({"role": "system", "content": system_text})
+
+        # Add system message at the start
+        if system_text:
+            out.append({"role": "system", "content": system_text})
+
+        last_role = "system" if system_text else None
 
         for msg in messages:
             role = msg.get("role", "user")
@@ -175,21 +185,29 @@ class OpenAICompatPlugin(ProviderPlugin):
             if isinstance(content, str):
                 # Handle string content (assistant with pre-built tool_calls)
                 if msg.get("tool_calls") and role == "assistant":
+                    # Fix ordering: if last was 'tool', we need 'assistant' first
+                    if last_role == "tool":
+                        out.append({"role": "assistant", "content": ""})
                     out.append({
                         "role": "assistant",
                         "content": content or "",
                         "tool_calls": msg["tool_calls"],
                     })
+                    last_role = "assistant"
                 else:
+                    # Fix ordering: after 'tool', must have 'assistant' before 'user'
+                    if last_role == "tool" and role == "user":
+                        out.append({"role": "assistant", "content": ""})
                     out.append({"role": role, "content": content or ""})
+                    last_role = role
             elif isinstance(content, list):
                 # Handle list of content blocks (Anthropic format)
                 tool_results = []
                 tool_uses = []
                 text_parts = []
                 image_parts = []
-                thinking_parts = []      # Preserve thinking for context
-                reasoning_parts = []     # For reasoning_content field
+                thinking_parts = []
+                reasoning_parts = []
 
                 for block in content:
                     if not isinstance(block, dict):
@@ -203,25 +221,15 @@ class OpenAICompatPlugin(ProviderPlugin):
                     elif block_type == "text":
                         text_parts.append(block.get("text", ""))
                     elif block_type == "thinking":
-                        # Preserve thinking blocks — they carry critical context.
-                        # For providers that support reasoning, we map to reasoning_content.
-                        # For others, we embed as a visible thinking section.
                         thinking_text = block.get("thinking", "")
                         if thinking_text:
                             thinking_parts.append(thinking_text)
                             reasoning_parts.append(thinking_text)
                     elif block_type == "redacted_thinking":
-                        # redacted_thinking blocks carry encrypted thinking data.
-                        # We can't decrypt them, but we must acknowledge their
-                        # existence to preserve conversation structure. Some
-                        # providers accept them as opaque blocks.
                         data = block.get("data", "")
                         if data:
-                            # Preserve as a marker so the conversation structure
-                            # is maintained even if the content is opaque
                             thinking_parts.append(f"[redacted:{data[:20]}...]")
                     elif block_type == "image":
-                        # Image URL handling
                         source = block.get("source", {})
                         if source.get("type") == "base64":
                             image_parts.append({
@@ -236,7 +244,6 @@ class OpenAICompatPlugin(ProviderPlugin):
                                 "image_url": {"url": source["url"]}
                             })
                     elif block_type == "document":
-                        # Document blocks (PDFs, files) — extract text content
                         source = block.get("source", {})
                         if source.get("type") == "text":
                             text_parts.append(source.get("text", ""))
@@ -272,7 +279,6 @@ class OpenAICompatPlugin(ProviderPlugin):
                 if tool_results:
                     for tr in tool_results:
                         rc = tr.get("content", "")
-                        # Handle list of content blocks in tool_result
                         if isinstance(rc, list):
                             text_content = []
                             for item in rc:
@@ -283,13 +289,20 @@ class OpenAICompatPlugin(ProviderPlugin):
                                 elif item.get("type") == "image":
                                     text_content.append("[image attached]")
                             rc = "\n".join(text_content)
+
+                        # Fix ordering: tool results need assistant before them
+                        # if the last message wasn't already assistant
+                        if last_role != "assistant" and last_role is not None:
+                            out.append({"role": "assistant", "content": ""})
+
                         out.append({
                             "role": "tool",
                             "tool_call_id": tr.get("tool_use_id", ""),
                             "content": rc or "",
                         })
+                        last_role = "tool"
 
-                # Emit tool uses as assistant message (with any leading text)
+                # Emit tool uses as assistant message
                 if tool_uses:
                     tool_calls = []
                     for tu in tool_uses:
@@ -307,50 +320,47 @@ class OpenAICompatPlugin(ProviderPlugin):
                             },
                         })
 
-                    # Build assistant content: thinking (as reasoning) + text
-                    assistant_content = ""
-                    if reasoning_parts:
-                        # Some providers use reasoning_content in the message
-                        # We'll add it as a structured part
-                        pass  # Handled below via content array
-                    if text_parts:
-                        assistant_content = "\n".join(text_parts)
+                    assistant_content = "\n".join(text_parts) if text_parts else ""
+
+                    # Fix ordering: after tool, must have assistant
+                    if last_role == "tool":
+                        pass  # We're emitting assistant now, so it's fine
 
                     out.append({
                         "role": "assistant",
-                        "content": assistant_content or "",
+                        "content": assistant_content,
                         "tool_calls": tool_calls,
-                        # Preserve thinking as reasoning_content for providers
-                        # that support it (DeepSeek, etc.)
                         **({"reasoning_content": "\n".join(reasoning_parts)} if reasoning_parts else {}),
                     })
+                    last_role = "assistant"
 
-                # Emit remaining text/images. Text alongside tool_results
-                # (e.g. interrupts, attachments) must NOT be dropped -- it is
-                # emitted as its own message after the tool messages.
+                # Emit remaining text/images (no tool calls)
                 if not tool_uses and (text_parts or image_parts or not tool_results):
+                    # Fix ordering: after tool, must have assistant before user
+                    if last_role == "tool" and role == "user":
+                        out.append({"role": "assistant", "content": ""})
+
                     if image_parts:
-                        # Multimodal: text + images
                         multimodal_content = []
                         if text_parts:
                             multimodal_content.append({"type": "text", "text": "\n".join(text_parts)})
                         multimodal_content.extend(image_parts)
                         out.append({"role": role, "content": multimodal_content})
                     elif text_parts or not tool_results:
-                        # For assistant messages with thinking, include reasoning
                         msg_content = "\n".join(text_parts) or ""
                         msg_out = {"role": role, "content": msg_content}
                         if role == "assistant" and reasoning_parts:
                             msg_out["reasoning_content"] = "\n".join(reasoning_parts)
                         out.append(msg_out)
+                    last_role = role
                 elif not tool_uses and not text_parts and not image_parts and not tool_results:
-                    # Empty content block list — emit thinking as reasoning if present
                     if role == "assistant" and reasoning_parts:
                         out.append({
                             "role": "assistant",
                             "content": "",
                             "reasoning_content": "\n".join(reasoning_parts),
                         })
+                        last_role = "assistant"
             else:
                 out.append({"role": role, "content": str(content or "")})
 
