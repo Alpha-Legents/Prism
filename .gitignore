@@ -1,4 +1,4 @@
-﻿__pycache__/
+__pycache__/
 *.pyc
 *.egg-info/
 dist/
@@ -12,3 +12,10 @@ venv/
 PKG-INFO
 prism_config.yaml
 tests/
+
+# Agent/tool config (not for repo)
+.claude/
+.mimocode/
+.agents/
+.codex/
+.opencode/
