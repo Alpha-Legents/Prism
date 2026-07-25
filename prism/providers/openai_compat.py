@@ -275,7 +275,7 @@ class OpenAICompatPlugin(ProviderPlugin):
 
                 # Emit tool results as separate messages
                 if tool_results:
-                    for tr in tool_results:
+                    for idx, tr in enumerate(tool_results):
                         rc = tr.get("content", "")
                         if isinstance(rc, list):
                             text_content = []
@@ -294,6 +294,17 @@ class OpenAICompatPlugin(ProviderPlugin):
                             "content": rc or "",
                         })
                         last_role = "tool"
+
+                    # After tool results, add assistant if there are more messages
+                    # (NVIDIA NIM requires assistant between tool and user)
+                    # Only add if there are more messages coming
+                    remaining_msgs = messages[messages.index(msg)+1:] if msg in messages else []
+                    has_more = bool(remaining_msgs) or role != "user"
+                    if has_more:
+                        # Use text content if available, otherwise minimal placeholder
+                        assistant_content = "\n".join(text_parts) if text_parts else ""
+                        out.append({"role": "assistant", "content": assistant_content or " "})
+                        last_role = "assistant"
 
                 # Emit tool uses as assistant message
                 if tool_uses:
