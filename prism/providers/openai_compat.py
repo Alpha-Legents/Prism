@@ -143,6 +143,17 @@ class OpenAICompatPlugin(ProviderPlugin):
         if stripped:
             logger.debug(f"Stripped Anthropic-only params: {stripped}")
 
+        # Debug: log output message roles
+        out_roles = [m.get("role") for m in req.get("messages", [])]
+        logger.info(f"TRANSLATED: {len(out_roles)} msgs, roles={out_roles}")
+
+        # Post-flight check for ordering violations
+        for i in range(len(out_roles) - 1):
+            if out_roles[i] == "tool" and out_roles[i+1] == "user":
+                logger.error(f"POST-FLIGHT FAIL: tool[{i}]→user[{i+1}] in output!")
+            if out_roles[i] == "system" and i > 0:
+                logger.error(f"POST-FLIGHT FAIL: system at position {i}!")
+
         return req
 
     def _translate_messages(self, messages: list, system: Any = None) -> list[dict]:

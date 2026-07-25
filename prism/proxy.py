@@ -305,6 +305,18 @@ async def _handle_request(request: Request, path: str):
     except Exception:
         body = {}
 
+    # Debug: log message roles to trace ordering issues
+    messages = body.get("messages", [])
+    roles = [m.get("role") for m in messages]
+    logger.info(f"REQUEST: {len(messages)} msgs, roles={roles}")
+
+    # Check for problematic patterns that will fail
+    for i in range(len(roles) - 1):
+        if roles[i] == "tool" and roles[i+1] == "user":
+            logger.error(f"PRE-FLIGHT FAIL: tool[{i}]→user[{i+1}] will be rejected!")
+        if roles[i] == "system" and i > 0:
+            logger.error(f"PRE-FLIGHT FAIL: system at position {i} (not first)!")
+
     # Auto-detect incoming format from the request body
     client_format = _detect_client_format(body, path)
     logger.debug(f"Detected client format: {client_format} (path={path})")
