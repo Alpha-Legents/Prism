@@ -295,13 +295,15 @@ class OpenAICompatPlugin(ProviderPlugin):
                         })
                         last_role = "tool"
 
-                    # After tool results, add assistant if there are more messages
+                    # After tool results, add assistant if next message is user
                     # (NVIDIA NIM requires assistant between tool and user)
-                    # Only add if there are more messages coming
-                    remaining_msgs = messages[messages.index(msg)+1:] if msg in messages else []
-                    has_more = bool(remaining_msgs) or role != "user"
-                    if has_more:
-                        # Use text content if available, otherwise minimal placeholder
+                    # Check if next message in original array is user (not assistant)
+                    msg_idx = messages.index(msg) if msg in messages else -1
+                    next_msg = messages[msg_idx + 1] if msg_idx >= 0 and msg_idx + 1 < len(messages) else None
+                    next_role = next_msg.get("role") if next_msg else None
+
+                    # Only add assistant if next is user (not assistant which we'd handle next)
+                    if next_role == "user" or next_role is None:
                         assistant_content = "\n".join(text_parts) if text_parts else ""
                         out.append({"role": "assistant", "content": assistant_content or " "})
                         last_role = "assistant"
