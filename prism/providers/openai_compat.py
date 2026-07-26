@@ -308,21 +308,10 @@ class OpenAICompatPlugin(ProviderPlugin):
                         })
                         last_role = "tool"
 
-                    # After tool results, add assistant if next message is NOT assistant
-                    # (NVIDIA NIM requires assistant between tool and user)
-                    # Find current message index and check next
-                    try:
-                        msg_idx = messages.index(msg)
-                        next_msg = messages[msg_idx + 1] if msg_idx + 1 < len(messages) else None
-                        next_role = next_msg.get("role") if next_msg else None
-                    except (ValueError, IndexError):
-                        next_role = None
-
-                    # Add assistant only if next is user (not assistant)
-                    if next_role != "assistant":
-                        assistant_content = "\n".join(text_parts) if text_parts else ""
-                        out.append({"role": "assistant", "content": assistant_content or " "})
-                        last_role = "assistant"
+                    # After tool results, ALWAYS add assistant (NVIDIA NIM requirement)
+                    assistant_content = "\n".join(text_parts) if text_parts else ""
+                    out.append({"role": "assistant", "content": assistant_content or " "})
+                    last_role = "assistant"
 
                 # Emit tool uses as assistant message
                 if tool_uses:
@@ -378,7 +367,25 @@ class OpenAICompatPlugin(ProviderPlugin):
             else:
                 out.append({"role": role, "content": str(content or "")})
 
-        return out
+        # Deduplicate consecutive messages with same role
+        # (except assistant which can have tool_calls vs content)
+        deduped = []
+        for msg in out:
+            if deduped and deduped[-1]["role"] == msg["role"]:
+                # Merge assistant messages (keep tool_calls from either)
+                if msg["role"] == "assistant":
+                    existing = deduped[-1]
+                    # Keep the one with tool_calls, or merge content
+                    if msg.get("tool_calls"):
+                        existing["content"] = msg.get("content", existing.get("content", ""))
+                        existing["tool_calls"] = msg["tool_calls"]
+                    elif msg.get("content") and msg["content"].strip():
+                        existing["content"] = msg["content"]
+                # Skip duplicate non-assistant messages
+                continue
+            deduped.append(msg)
+
+        return deduped
 
     def _translate_tool_choice(self, tc: dict | str) -> str | dict:
         if isinstance(tc, dict):
